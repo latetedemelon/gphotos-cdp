@@ -1,4 +1,4 @@
-module github.com/msfjarvis/gphotos-cdp
+module github.com/latetedemelon/gphotos-cdp
 
 go 1.17
 
