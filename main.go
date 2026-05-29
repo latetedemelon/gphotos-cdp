@@ -468,9 +468,13 @@ func (s *Session) firstNav(ctx context.Context) error {
 func (s *Session) setFirstItem(ctx context.Context) error {
 	// wait for page to be loaded, i.e. that we can make an element active by using
 	// the right arrow key.
+	deadline := time.Now().Add(2 * time.Minute)
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
+		}
+		if time.Now().After(deadline) {
+			return errors.New("timed out waiting for the photo grid to load (no ./photo/ item became active)")
 		}
 		chromedp.KeyEvent(kb.ArrowRight).Do(ctx)
 		time.Sleep(tick)
@@ -542,6 +546,7 @@ func navToEnd(ctx context.Context) error {
 func navToLast(ctx context.Context) error {
 	var location, prevLocation string
 	ready := false
+	deadline := time.Now().Add(2 * time.Minute)
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -560,6 +565,8 @@ func navToLast(ctx context.Context) error {
 			if strings.Contains(location, "/photo/") {
 				ready = true
 				logger.Debug("entered photo view", "location", location)
+			} else if time.Now().After(deadline) {
+				return errors.New("timed out waiting to enter the photo view")
 			}
 			continue
 		}
