@@ -320,7 +320,7 @@ func TestStartURL(t *testing.T) {
 }
 
 func TestIsIgnoredDLFile(t *testing.T) {
-	for _, n := range []string{".lastdone", ".lastdone.bak", "debug.png", "debug.html"} {
+	for _, n := range []string{".lastdone", ".lastdone.bak", "debug.png", "debug.html", manifestName, manifestName + ".tmp"} {
 		if !isIgnoredDLFile(n) {
 			t.Errorf("isIgnoredDLFile(%q) = false, want true", n)
 		}
