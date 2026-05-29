@@ -258,7 +258,8 @@ Limitations & future work
 - Progress tracking is a single `.lastdone` sentinel rather than a full index,
   so re-downloading a specific item means using `-start`.
 
-Contributions are welcome.
+Contributions are welcome. Planned work and ideas are tracked in
+[BACKLOG.md](BACKLOG.md).
 
 
 What if Google Photos breaks this tool on purpose or by accident?
