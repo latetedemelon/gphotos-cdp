@@ -18,6 +18,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -26,10 +27,11 @@ import (
 
 // fakeItem is one scripted item the fakeBrowser walks through.
 type fakeItem struct {
-	location string
-	date     time.Time
-	haveDate bool
-	files    []string // base filenames "downloaded" into the download dir
+	location  string
+	date      time.Time
+	haveDate  bool
+	files     []string // base filenames "downloaded" into the download dir
+	failTimes int      // number of leading Download attempts that should fail
 }
 
 // fakeBrowser implements Browser without a real Chrome: Location/PhotoTime read
@@ -43,6 +45,7 @@ type fakeBrowser struct {
 	panels    int
 	nexts     int
 	downloads int
+	attempts  map[string]int // Download calls per location, for failTimes
 }
 
 func (b *fakeBrowser) Start(context.Context) error         { b.starts++; return nil }
@@ -57,8 +60,16 @@ func (b *fakeBrowser) PhotoTime(context.Context) (time.Time, bool) {
 
 func (b *fakeBrowser) Download(context.Context) ([]string, error) {
 	b.downloads++
+	it := b.cur()
+	if b.attempts == nil {
+		b.attempts = map[string]int{}
+	}
+	b.attempts[it.location]++
+	if b.attempts[it.location] <= it.failTimes {
+		return nil, fmt.Errorf("fake download failure #%d for %s", b.attempts[it.location], it.location)
+	}
 	var names []string
-	for _, n := range b.cur().files {
+	for _, n := range it.files {
 		if err := os.WriteFile(filepath.Join(b.dlDir, n), []byte("fake:"+n), 0600); err != nil {
 			return nil, err
 		}
@@ -258,6 +269,110 @@ func TestNavNOrganize(t *testing.T) {
 	if it, ok := m.Get("id1"); !ok || it.Status != StatusDone || len(it.Files) != 1 {
 		t.Errorf("organized item wrong: %+v (ok=%v)", it, ok)
 	}
+}
+
+func TestNavNRetriesTransientFailure(t *testing.T) {
+	defer func(d time.Duration) { retryBaseDelay = d }(retryBaseDelay)
+	retryBaseDelay = 0 // no backoff in tests
+
+	dir := t.TempDir()
+	s := &Session{dlDir: dir, firstItem: "id1"}
+	m, _ := LoadManifest(dir)
+	fb := &fakeBrowser{dlDir: dir, items: []fakeItem{
+		{location: photo("id1"), files: []string{"a.jpg"}, failTimes: 2}, // fails twice, ok on 3rd
+	}}
+
+	if err := s.navN(fb, m, -1, time.Time{}, time.Time{})(context.Background()); err != nil {
+		t.Fatalf("navN: %v", err)
+	}
+
+	mustExist(t, filepath.Join(dir, "id1", "a.jpg"))
+	if it, ok := m.Get("id1"); !ok || it.Status != StatusDone {
+		t.Errorf("id1 status = %v, want done", statusOf(it))
+	}
+	if fb.downloads != 3 {
+		t.Errorf("downloads = %d, want 3 (2 failures + 1 success)", fb.downloads)
+	}
+}
+
+func TestNavNErrorIsolationContinues(t *testing.T) {
+	defer func(d time.Duration) { retryBaseDelay = d }(retryBaseDelay)
+	retryBaseDelay = 0
+
+	dir := t.TempDir()
+	s := &Session{dlDir: dir, firstItem: "id3"}
+	m, _ := LoadManifest(dir)
+	fb := &fakeBrowser{dlDir: dir, items: []fakeItem{
+		{location: photo("id1"), files: []string{"a.jpg"}},
+		{location: photo("id2"), files: []string{"b.jpg"}, failTimes: 99}, // always fails
+		{location: photo("id3"), files: []string{"c.jpg"}},
+	}}
+
+	// A single bad item must not abort the run.
+	if err := s.navN(fb, m, -1, time.Time{}, time.Time{})(context.Background()); err != nil {
+		t.Fatalf("navN should not return an error on an isolated item failure: %v", err)
+	}
+
+	mustExist(t, filepath.Join(dir, "id1", "a.jpg"))
+	mustNotExist(t, filepath.Join(dir, "id2", "b.jpg"))
+	mustExist(t, filepath.Join(dir, "id3", "c.jpg"))
+
+	c := m.Counts()
+	if c[StatusDone] != 2 || c[StatusErrored] != 1 {
+		t.Errorf("counts = %v, want done=2 errored=1", c)
+	}
+	if it, ok := m.Get("id2"); !ok || it.Status != StatusErrored || it.Attempts != *maxAttemptsFlag {
+		t.Errorf("id2 = %+v, want errored with %d attempts", it, *maxAttemptsFlag)
+	}
+}
+
+func TestNavNSkipsAlreadyDone(t *testing.T) {
+	dir := t.TempDir()
+	s := &Session{dlDir: dir, firstItem: "id2"}
+	m, _ := LoadManifest(dir)
+	// id1 was completed on a previous run.
+	m.Done(photo("id1"), []string{"/prev/id1/a.jpg"}, 1)
+
+	fb := &fakeBrowser{dlDir: dir, items: []fakeItem{
+		{location: photo("id1"), files: []string{"a.jpg"}},
+		{location: photo("id2"), files: []string{"b.jpg"}},
+	}}
+
+	if err := s.navN(fb, m, -1, time.Time{}, time.Time{})(context.Background()); err != nil {
+		t.Fatalf("navN: %v", err)
+	}
+
+	// id1 must not be re-downloaded this run; id2 is new.
+	if fb.attempts[photo("id1")] != 0 {
+		t.Errorf("id1 was downloaded %d times, want 0 (already done)", fb.attempts[photo("id1")])
+	}
+	mustExist(t, filepath.Join(dir, "id2", "b.jpg"))
+	mustNotExist(t, filepath.Join(dir, "id1", "a.jpg"))
+}
+
+func TestNavNGivesUpAfterMaxAttempts(t *testing.T) {
+	defer func(v int) { *maxAttemptsFlag = v }(*maxAttemptsFlag)
+	*maxAttemptsFlag = 2
+
+	dir := t.TempDir()
+	s := &Session{dlDir: dir, firstItem: "id1"}
+	m, _ := LoadManifest(dir)
+	// id1 already used up its attempts on previous runs.
+	m.Errored(photo("id1"), fmt.Errorf("x"))
+	m.Errored(photo("id1"), fmt.Errorf("x"))
+
+	fb := &fakeBrowser{dlDir: dir, items: []fakeItem{
+		{location: photo("id1"), files: []string{"a.jpg"}},
+	}}
+
+	if err := s.navN(fb, m, -1, time.Time{}, time.Time{})(context.Background()); err != nil {
+		t.Fatalf("navN: %v", err)
+	}
+
+	if fb.downloads != 0 {
+		t.Errorf("downloads = %d, want 0 (attempts already exhausted)", fb.downloads)
+	}
+	mustNotExist(t, filepath.Join(dir, "id1", "a.jpg"))
 }
 
 // statusOf is a nil-safe helper for error messages.

@@ -207,6 +207,29 @@ func (m *Manifest) Counts() map[ItemStatus]int {
 	return out
 }
 
+// NewestDone returns the most recently-seen completed item, or nil. Because
+// items are recorded in timeline order (oldest first), this is the natural
+// resume point: the run continues forward from the newest item already done.
+func (m *Manifest) NewestDone() *Item {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i := len(m.order) - 1; i >= 0; i-- {
+		if it := m.items[m.order[i]]; it != nil && it.Status == StatusDone {
+			return it
+		}
+	}
+	return nil
+}
+
+// ResumeURL returns the URL the next run should resume from (the newest done
+// item), or "" if nothing has completed yet (start from the oldest item).
+func (m *Manifest) ResumeURL() string {
+	if it := m.NewestDone(); it != nil {
+		return it.URL
+	}
+	return ""
+}
+
 // snapshot returns the items in stable order. The caller must hold m.mu.
 func (m *Manifest) snapshot() []*Item {
 	items := make([]*Item, 0, len(m.order))

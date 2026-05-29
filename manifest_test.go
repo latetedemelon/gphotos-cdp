@@ -122,6 +122,26 @@ func TestManifestSaveAtomicAndIgnored(t *testing.T) {
 	}
 }
 
+func TestNewestDoneAndResumeURL(t *testing.T) {
+	m, _ := LoadManifest(t.TempDir())
+	if m.ResumeURL() != "" {
+		t.Errorf("empty manifest ResumeURL = %q, want \"\"", m.ResumeURL())
+	}
+
+	// Insertion order is timeline order (oldest first): A done, B errored, C done.
+	m.Done(urlA, nil, 0)
+	m.Errored(urlB, errors.New("x"))
+	m.Done(urlC, nil, 0)
+
+	nd := m.NewestDone()
+	if nd == nil || nd.ID != "idC" {
+		t.Fatalf("NewestDone = %+v, want idC", nd)
+	}
+	if got := m.ResumeURL(); got != urlC {
+		t.Errorf("ResumeURL = %q, want %q", got, urlC)
+	}
+}
+
 func TestManifestCSV(t *testing.T) {
 	m, _ := LoadManifest(t.TempDir())
 	date := time.Date(2024, 3, 14, 0, 0, 0, 0, time.UTC)
