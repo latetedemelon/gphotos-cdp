@@ -196,6 +196,14 @@ func (m *Manifest) IsDone(url string) bool {
 	return ok && it.Status == StatusDone
 }
 
+// Items returns the items in stable (oldest-first) order. The returned pointers
+// are the live records; callers (status/verify) treat them as read-only.
+func (m *Manifest) Items() []*Item {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.snapshot()
+}
+
 // Counts summarises the manifest by status.
 func (m *Manifest) Counts() map[ItemStatus]int {
 	m.mu.Lock()

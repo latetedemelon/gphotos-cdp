@@ -122,6 +122,62 @@ func TestManifestSaveAtomicAndIgnored(t *testing.T) {
 	}
 }
 
+func TestSummarize(t *testing.T) {
+	m, _ := LoadManifest(t.TempDir())
+	m.Done(urlA, []string{"/x/a.jpg"}, 100)
+	m.Done(urlB, []string{"/x/b.jpg"}, 50)
+	m.Errored(urlC, errors.New("x"))
+
+	counts, totalBytes, total := summarize(m)
+	if total != 3 || totalBytes != 150 {
+		t.Errorf("summarize total=%d bytes=%d, want 3/150", total, totalBytes)
+	}
+	if counts[StatusDone] != 2 || counts[StatusErrored] != 1 {
+		t.Errorf("counts = %v", counts)
+	}
+}
+
+func TestVerifyManifest(t *testing.T) {
+	dir := t.TempDir()
+	m, _ := LoadManifest(dir)
+
+	// good: file exists and total size matches.
+	good := filepath.Join(dir, "good.jpg")
+	if err := os.WriteFile(good, []byte("12345"), 0600); err != nil { // 5 bytes
+		t.Fatal(err)
+	}
+	m.Done("https://photos.google.com/photo/idGood", []string{good}, 5)
+
+	// missing: recorded file does not exist.
+	m.Done("https://photos.google.com/photo/idMissing", []string{filepath.Join(dir, "nope.jpg")}, 10)
+
+	// size mismatch: file exists but its size differs from the recorded total.
+	bad := filepath.Join(dir, "bad.jpg")
+	if err := os.WriteFile(bad, []byte("xx"), 0600); err != nil { // 2 bytes
+		t.Fatal(err)
+	}
+	m.Done("https://photos.google.com/photo/idBad", []string{bad}, 999)
+
+	// done but no files recorded: not checkable, skipped.
+	m.Done("https://photos.google.com/photo/idNoFiles", nil, 0)
+	// not done: ignored.
+	m.Errored("https://photos.google.com/photo/idErr", errors.New("x"))
+
+	res := verifyManifest(m)
+	if res.Checked != 3 {
+		t.Errorf("Checked = %d, want 3", res.Checked)
+	}
+	if res.OK != 1 {
+		t.Errorf("OK = %d, want 1", res.OK)
+	}
+	if len(res.Missing) != 1 || res.Missing[0] != "https://photos.google.com/photo/idMissing" {
+		t.Errorf("Missing = %v", res.Missing)
+	}
+	if len(res.SizeMismatch) != 1 || res.SizeMismatch[0] != "https://photos.google.com/photo/idBad" {
+		t.Errorf("SizeMismatch = %v", res.SizeMismatch)
+	}
+}
+
 func TestNewestDoneAndResumeURL(t *testing.T) {
 	m, _ := LoadManifest(t.TempDir())
 	if m.ResumeURL() != "" {

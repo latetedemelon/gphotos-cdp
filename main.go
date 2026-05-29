@@ -67,6 +67,7 @@ var (
 	dryRunFlag      = flag.Bool("dry-run", false, "walk the timeline and log what would be downloaded, without downloading anything or touching the download dir")
 	maxAttemptsFlag = flag.Int("max-attempts", 3, "how many times to attempt an item (across runs) before giving up on it")
 	failOnErrorFlag = flag.Bool("fail-on-error", false, "exit non-zero if the run completes with any items still in the errored state")
+	csvFlag         = flag.String("csv", "", "with the 'status' command, also write the full inventory to this CSV file")
 )
 
 // chromeFlagsFlag collects -chrome-flag occurrences: raw flags passed straight
@@ -152,8 +153,31 @@ func fatal(msg string, args ...any) {
 }
 
 func main() {
-	flag.Parse()
+	// Optional first positional arg is a subcommand; everything else is flags.
+	// No subcommand keeps the historical behaviour: gphotos-cdp [flags] = sync.
+	args := os.Args[1:]
+	cmd := ""
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		cmd, args = args[0], args[1:]
+	}
+	// flag.CommandLine uses ExitOnError: a bad flag prints usage and exits.
+	_ = flag.CommandLine.Parse(args)
 	setupLogger()
+
+	switch cmd {
+	case "", "sync", "download":
+		runSync()
+	case "status":
+		runStatus()
+	case "verify":
+		runVerify()
+	default:
+		fatal("unknown command (expected sync, status or verify)", "command", cmd)
+	}
+}
+
+// runSync is the default command: it drives Chrome and downloads items.
+func runSync() {
 	if *nItemsFlag == 0 {
 		return
 	}
@@ -231,6 +255,105 @@ func main() {
 	}
 	logger.Info("all done")
 	fmt.Println("OK")
+}
+
+// summarize returns the status counts, total downloaded bytes and item count.
+func summarize(m *Manifest) (counts map[ItemStatus]int, totalBytes int64, total int) {
+	counts = m.Counts()
+	for _, it := range m.Items() {
+		total++
+		totalBytes += it.Bytes
+	}
+	return counts, totalBytes, total
+}
+
+// runStatus prints a summary of the manifest. It needs no Chrome and does not
+// authenticate; it just reads <dldir>/.manifest.json.
+func runStatus() {
+	dlDir := defaultDownloadDir()
+	m, err := LoadManifest(dlDir)
+	if err != nil {
+		fatal("could not load manifest", "err", err)
+	}
+	counts, totalBytes, total := summarize(m)
+	fmt.Printf("download dir: %s\n", dlDir)
+	fmt.Printf("items: %d  (done %d, pending %d, errored %d, skipped %d)\n",
+		total, counts[StatusDone], counts[StatusPending], counts[StatusErrored], counts[StatusSkipped])
+	fmt.Printf("downloaded bytes: %d\n", totalBytes)
+
+	if *csvFlag != "" {
+		f, err := os.Create(*csvFlag)
+		if err != nil {
+			fatal("could not create CSV", "err", err)
+		}
+		defer f.Close()
+		if err := m.WriteCSV(f); err != nil {
+			fatal("could not write CSV", "err", err)
+		}
+		fmt.Printf("wrote inventory CSV: %s\n", *csvFlag)
+	}
+}
+
+// VerifyResult is the outcome of verifying downloaded files against the manifest.
+type VerifyResult struct {
+	Checked      int      // completed items examined
+	OK           int      // items whose files all exist and match
+	Missing      []string // URLs of items with a missing file
+	SizeMismatch []string // URLs of items whose total size no longer matches
+}
+
+// verifyManifest checks that every completed item's files still exist and that
+// their total size matches what was recorded. It is read-only.
+func verifyManifest(m *Manifest) VerifyResult {
+	var res VerifyResult
+	for _, it := range m.Items() {
+		if it.Status != StatusDone || len(it.Files) == 0 {
+			continue
+		}
+		res.Checked++
+		var total int64
+		missing := false
+		for _, f := range it.Files {
+			fi, err := os.Stat(f)
+			if err != nil {
+				missing = true
+				break
+			}
+			total += fi.Size()
+		}
+		switch {
+		case missing:
+			res.Missing = append(res.Missing, it.URL)
+		case it.Bytes > 0 && total != it.Bytes:
+			res.SizeMismatch = append(res.SizeMismatch, it.URL)
+		default:
+			res.OK++
+		}
+	}
+	return res
+}
+
+// runVerify checks downloaded files against the manifest (no Chrome needed) and
+// exits non-zero if any are missing or changed.
+func runVerify() {
+	dlDir := defaultDownloadDir()
+	m, err := LoadManifest(dlDir)
+	if err != nil {
+		fatal("could not load manifest", "err", err)
+	}
+	res := verifyManifest(m)
+	fmt.Printf("verified %d completed items: %d OK, %d missing, %d size-mismatch\n",
+		res.Checked, res.OK, len(res.Missing), len(res.SizeMismatch))
+	for _, u := range res.Missing {
+		fmt.Printf("  missing: %s\n", u)
+	}
+	for _, u := range res.SizeMismatch {
+		fmt.Printf("  size mismatch: %s\n", u)
+	}
+	if len(res.Missing)+len(res.SizeMismatch) > 0 {
+		fmt.Println("re-fetch a bad item with: gphotos-cdp -dev -start <url>")
+		os.Exit(1)
+	}
 }
 
 type Session struct {
