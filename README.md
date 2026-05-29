@@ -290,7 +290,8 @@ Limitations & future work
   re-tried automatically on later runs (a `-retry-errored` mode is future work);
   for now, re-downloading a specific item means using `-start`.
 
-Contributions are welcome.
+Contributions are welcome. Planned work and ideas are tracked in
+[BACKLOG.md](BACKLOG.md).
 
 
 What if Google Photos breaks this tool on purpose or by accident?
