@@ -59,6 +59,8 @@ tracks progress by item URL, so changing the folder layout never breaks resume.
 - **Durable progress index.** Replace the single `.lastdone` sentinel with a
   manifest (JSON or SQLite) of per-item id / date / files / checksum. Enables
   re-download by id, integrity checks, and resume that survives deletions.
+  See **Repurposed from gdrive-migration** below for the expanded design — this
+  is the keystone item that unlocks most of the others.
 - **Integrity verification.** Record size (and a hash) per item; re-download on
   mismatch.
 - **Date-detection hardening.** More `aria-label` / `<time>` selectors; an
@@ -84,10 +86,68 @@ tracks progress by item URL, so changing the folder layout never breaks resume.
 - **Release hygiene.** Keep tags moving so `@latest` never resolves back to the
   buggy `0.0.1`; the container should always pin an explicit version.
 
-## Ideas under evaluation
+## Repurposed from gdrive-migration
 
-- **`latetedemelon/gdrive-migration`** — review for patterns worth repurposing
-  (resumable sync / manifest, OAuth & token-refresh handling, concurrency,
-  rate-limit backoff, deduplication, integrity verification, folder-structure
-  preservation). *Blocked: the repo is private and outside this tool's access —
-  needs read access or a pasted README/file list before it can be mined.*
+`latetedemelon/gdrive-migration` is a manifest-driven, resumable Drive→Drive
+tool. It talks to the Drive **API**, so its API-level mechanics don't transfer,
+but its higher-level architecture maps almost 1:1 onto the gaps above. The
+meta-lesson: it began as a ~120-line script and matured by moving state into a
+**SQLite store**, which then unlocked a cluster of features. Our `.lastdone`
+sentinel is at that "120-line script" stage; the same move unlocks most of the
+items below.
+
+### Adopt (strong fit)
+
+- **State DB / manifest (replaces `.lastdone`).** Thread-safe SQLite (or JSON)
+  store of per-item rows: photo id, URL, capture date, downloaded filenames,
+  status (pending/done/errored/skipped), attempts, size/hash, batch/run id.
+  The keystone — everything below depends on it. (gdrive: `state.py`.)
+- **Error isolation + per-item retry (`-max-attempts`).** Today one failed item
+  aborts the whole run. Instead: record the item as errored, continue, and retry
+  up to N times across re-runs. Essential for multi-hour libraries. (gdrive:
+  `--max-attempts`, errored items retried on re-run.)
+- **Integrity + a `verify` mode.** Record each file's size/hash in the manifest;
+  re-verify on demand and re-download mismatches. (gdrive: MD5-after-upload + a
+  `verify` subcommand.)
+- **De-duplication (`-dedupe report|skip`).** Group downloaded files by content
+  hash; report or collapse duplicates, recording a pointer so re-runs stay
+  idempotent and nothing is silently dropped. (gdrive: `--dedupe report|skip`.)
+- **Status + CSV inventory.** A `status` view over the manifest (counts by
+  year / media type / status) plus CSV export. Cheap once the manifest exists,
+  and a natural body for the container's healthcheck ping. (gdrive: `status
+  --csv`.)
+- **Testable orchestration via a fake.** gdrive unit-tests its whole
+  scan→migrate→verify flow against an in-memory **fake Drive** — no network, no
+  creds. Our analog: hide the chromedp calls (navigate / read-date / download /
+  move) behind a small interface so `navN`, the download loop and organize logic
+  can run against a fake browser. Closes our biggest test gap — the
+  browser-driving paths currently have no unit coverage. (gdrive:
+  `tests/conftest.py`.)
+
+### Consider (medium fit)
+
+- **Richer `-organize` schemes.** Beyond `YYYY/MM`: by year, by media type
+  (Photos/Videos/Motion), or type/year — made pluggable like gdrive's
+  `category | category-year | topic`. (Their filename/path keyword "topic" axis
+  is a poor fit for `IMG_####` photo names; skip that one.)
+- **Provenance / metadata sidecar.** gdrive stamps `migrated_from` id + source
+  hash + batch onto each file. We can't write Drive properties (we download
+  locally), but we can emit a per-item JSON sidecar (URL, id, scraped date,
+  original filename, run id) — the same shape Google Takeout uses, handy for
+  re-import and auditing.
+- **Scan/download phase split + subcommands.** gdrive separates `scan` (walk
+  into the DB) from `migrate`, plus `status`/`verify`. A `scan` that records the
+  timeline (what `-dry-run` already walks) followed by a `download` pass over the
+  manifest would make discovery itself resumable and allow status before any
+  download. Larger change; natural once the manifest lands.
+- **`DECISIONS.md`.** They keep a design-rationale log; worth adopting here.
+
+### Not applicable (API/Docs-specific — noted for completeness)
+
+- OAuth / service-account auth, domain-wide delegation — we authenticate via the
+  browser session; there is no API.
+- Drive-v3 pagination and resumable chunked up/download — the browser performs
+  the download; we only watch the file land.
+- Google-native export (Doc→`.docx`) and Drive file-property tagging — no analog
+  for photo bytes.
+- Keyword "topic" taxonomy — poor fit for `IMG_####`-style photo names.
