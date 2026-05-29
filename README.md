@@ -99,7 +99,19 @@ Usage
 --------
 
 ```
-gphotos-cdp [flags]
+gphotos-cdp [flags]          # download (the default command)
+gphotos-cdp status [flags]   # print a summary of progress (no Chrome needed)
+gphotos-cdp verify [flags]   # check that downloaded files still exist and match
+```
+
+`status` and `verify` read `<dldir>/.manifest.json` and don't open a browser, so
+they're instant and need no authentication. Point them at your library with
+`-dldir`:
+
+```sh
+gphotos-cdp status -dldir /download
+gphotos-cdp status -dldir /download -csv inventory.csv   # also export an inventory
+gphotos-cdp verify -dldir /download                      # exits non-zero if any file is missing/changed
 ```
 
 | Flag | Default | Description |
@@ -122,6 +134,7 @@ gphotos-cdp [flags]
 | `-dl-timeout` | `1m` | How long a single download may stall before giving up. |
 | `-max-attempts` | `3` | Attempts per item (counted across runs) before giving up on it. A failed item is isolated so the run continues. |
 | `-fail-on-error` | `false` | Exit non-zero if the run finishes with any items still in the errored state. |
+| `-csv` | – | With the `status` command, also write the full inventory to this CSV file. |
 | `-json` | `false` | Emit logs as JSON. |
 | `-log-level` | `info` | Log level: `debug`, `info`, `warn`, `error`. |
 | `-v` | `false` | Verbose; shortcut for `-log-level=debug`. |
