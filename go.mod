@@ -1,6 +1,6 @@
 module github.com/latetedemelon/gphotos-cdp
 
-go 1.17
+go 1.21
 
 require (
 	github.com/chromedp/cdproto v0.0.0-20241003230502-a4a8f7c660df
