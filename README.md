@@ -110,6 +110,7 @@ gphotos-cdp [flags]
 | `-dldir` | `$HOME/Downloads/gphotos-cdp` | Where to write downloads. |
 | `-session-dir` | `$TMPDIR/gphotos-cdp` | Where to load/save the Chrome profile in `-dev` mode. |
 | `-chrome-exec-path` | auto-detect | Path to the Chrome/Chromium binary. |
+| `-chrome-flag` | – | Extra raw flag passed straight to Chrome; repeatable. Needed in containers (see below). |
 | `-headless` | `false` | Run Chrome headless. Only valid with `-dev` (you must already be authenticated). |
 | `-run` | – | Program to run on each downloaded file, right after it is downloaded. |
 | `-from` | – | Only download items taken on or after this date (`YYYY-MM-DD`). Best-effort. |
@@ -168,6 +169,29 @@ committing to a long run):
 ```
 
 
+Running headless in a container
+--------
+
+Chromium needs a couple of extra flags to launch inside a container (it won't
+run as root without `--no-sandbox`, and crashes on the small default `/dev/shm`).
+Pass them through with `-chrome-flag`, point `-chrome-exec-path` at the system
+binary, and authenticate once (with the profile dir mounted) before going
+unattended:
+
+```sh
+gphotos-cdp -json -dev -headless \
+  -chrome-exec-path /usr/bin/chromium-browser \
+  -chrome-flag --no-sandbox \
+  -chrome-flag --disable-dev-shm-usage \
+  -dldir /download -organize -mtime
+```
+
+On very new Chromium builds that have dropped the old headless mode, also add
+`-chrome-flag --headless=new` (it overrides the default `-headless`). The
+profile/auth lives in `-session-dir` (default `/tmp/gphotos-cdp`); mount that
+path to persist the login across runs.
+
+
 How it works
 --------
 
@@ -184,13 +208,22 @@ How it works
 Live Photos / motion photos that download as more than one file are handled:
 all resulting files are moved together and `-run` is invoked on each.
 
+Every per-item log line carries the item's URL in a stable `location` field
+(`location=https://photos.google.com/photo/…` in text logs, `"location"` in
+JSON), so you can always recover the last processed item by grepping the logs.
+
 
 Notes on the date-based features
 --------
 
-`-from`, `-to`, `-organize` and `-mtime` rely on reading each item's capture
-date from the Google Photos web UI (the tool opens the info side panel and
-scrapes it). Because that UI is not a stable API, these features are
+`-from`, `-to`, `-organize` and `-mtime` use the capture date Google shows in
+the web UI (the tool opens the info side panel and reads it). This is the date
+Google holds for the item, so it is available even for videos, HEIC, and
+screenshots that often have **no EXIF `DateTimeOriginal`** — which is why doing
+the foldering/timestamping here, in one pass, is more complete than EXIF-based
+post-processing (no skipped files, no empty folders).
+
+The flip side is that the web UI is not a stable API, so reading the date is
 **best-effort**:
 
 - If a date cannot be read for an item, the item is **still downloaded** (it is
@@ -198,10 +231,21 @@ scrapes it). Because that UI is not a stable API, these features are
 - The date parser understands the common formats Google renders (e.g.
   `Mar 14, 2024, 12:08:27 PM`, including the narrow no-break space Google uses
   before AM/PM, and ISO `datetime` attributes).
+- `-dry-run` is the safe way to confirm date detection works for your library
+  before committing to a long run.
 
-Without `-organize`, each item keeps its own id-named sub-folder under the
-download dir (the historical behaviour). With `-organize`, items are grouped
-into `YYYY/MM/` instead.
+Folder layout:
+
+- **Without `-organize`** each item keeps its own id-named sub-folder:
+  `<dldir>/<itemId>/<file>` (the historical behaviour).
+- **With `-organize`** items are grouped by date: `<dldir>/YYYY/MM/<file>`
+  (unknown dates → `<dldir>/unknown/<file>`). If two items share an original
+  filename in the same month, the later one gets its item id appended to keep
+  them distinct.
+
+`-organize`/`-mtime` are independent of resume: progress is tracked by item URL
+in `.lastdone`, not by folder, so the layout can change between runs and `-run`
+always receives the file's final path.
 
 
 Limitations & future work

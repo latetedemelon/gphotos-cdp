@@ -357,6 +357,30 @@ func TestUniqueDest(t *testing.T) {
 	}
 }
 
+func TestParseChromeFlag(t *testing.T) {
+	cases := []struct {
+		in   string
+		name string
+		val  interface{}
+	}{
+		{"--no-sandbox", "no-sandbox", true},
+		{"--disable-dev-shm-usage", "disable-dev-shm-usage", true},
+		{"--headless=new", "headless", "new"},
+		{"no-sandbox", "no-sandbox", true},
+		{"-single-dash", "single-dash", true},
+		{"--remote-debugging-port=9222", "remote-debugging-port", "9222"},
+		{"  --window-size=1280,1024  ", "window-size", "1280,1024"},
+		{"", "", nil},
+		{"--", "", nil},
+	}
+	for _, c := range cases {
+		name, val := parseChromeFlag(c.in)
+		if name != c.name || val != c.val {
+			t.Errorf("parseChromeFlag(%q) = (%q, %v), want (%q, %v)", c.in, name, val, c.name, c.val)
+		}
+	}
+}
+
 func TestTimeAttr(t *testing.T) {
 	if got := timeAttr(time.Time{}, false); got != "unknown" {
 		t.Errorf("timeAttr(unknown) = %q, want %q", got, "unknown")

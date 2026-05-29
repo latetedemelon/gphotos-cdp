@@ -67,6 +67,40 @@ var (
 	dryRunFlag    = flag.Bool("dry-run", false, "walk the timeline and log what would be downloaded, without downloading anything or touching the download dir")
 )
 
+// chromeFlagsFlag collects -chrome-flag occurrences: raw flags passed straight
+// through to Chrome. Repeatable.
+var chromeFlagsFlag stringSliceFlag
+
+func init() {
+	flag.Var(&chromeFlagsFlag, "chrome-flag",
+		"extra raw flag to pass to Chrome; repeatable. Needed to run Chromium in a container, e.g. -chrome-flag --no-sandbox -chrome-flag --disable-dev-shm-usage (and -chrome-flag --headless=new on newer Chromium)")
+}
+
+// stringSliceFlag is a flag.Value that accumulates repeated string flags.
+type stringSliceFlag []string
+
+func (s *stringSliceFlag) String() string { return strings.Join(*s, " ") }
+
+func (s *stringSliceFlag) Set(v string) error {
+	*s = append(*s, v)
+	return nil
+}
+
+// parseChromeFlag turns a raw Chrome flag like "--no-sandbox" or
+// "--headless=new" into a (name, value) pair for chromedp.Flag. A flag with no
+// "=" is a boolean (value true); otherwise the part after "=" is the value.
+// Returns an empty name for input that is blank after trimming dashes.
+func parseChromeFlag(s string) (string, interface{}) {
+	s = strings.TrimLeft(strings.TrimSpace(s), "-")
+	if s == "" {
+		return "", nil
+	}
+	if name, value, found := strings.Cut(s, "="); found {
+		return strings.TrimSpace(name), value
+	}
+	return s, true
+}
+
 // libraryURL is the entry point for the Google Photos main library.
 const libraryURL = "https://photos.google.com/"
 
@@ -254,8 +288,6 @@ func (s *Session) NewContext(parent context.Context) (context.Context, context.C
 		chromedp.NoDefaultBrowserCheck,
 		chromedp.UserDataDir(s.profileDir),
 		chromedp.Flag("enable-automation", true),
-		chromedp.Flag("disable-web-security", true),
-		chromedp.Flag("allow-running-insecure-content", true),
 	}
 	if *execPathFlag != "" {
 		opts = append(opts, chromedp.ExecPath(*execPathFlag))
@@ -270,6 +302,17 @@ func (s *Session) NewContext(parent context.Context) (context.Context, context.C
 		opts = append(opts, chromedp.Flag("mute-audio", false))
 		opts = append(opts, chromedp.Flag("disable-gpu", false))
 	}
+
+	// User-supplied passthrough flags, applied last so they can override the
+	// defaults above (e.g. -chrome-flag --headless=new). Running Chromium inside
+	// a container typically needs:
+	//   -chrome-flag --no-sandbox -chrome-flag --disable-dev-shm-usage
+	for _, cf := range chromeFlagsFlag {
+		if name, value := parseChromeFlag(cf); name != "" {
+			opts = append(opts, chromedp.Flag(name, value))
+		}
+	}
+
 	ctx, cancel := chromedp.NewExecAllocator(parent, opts...)
 	s.parentContext = ctx
 	s.parentCancel = cancel
