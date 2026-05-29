@@ -185,6 +185,11 @@ func main() {
 		}
 	}
 
+	m, err := LoadManifest(s.dlDir)
+	if err != nil {
+		fatal("could not load manifest", "err", err)
+	}
+
 	browserCtx, cancel := s.NewContext(ctx)
 	defer cancel()
 
@@ -196,9 +201,10 @@ func main() {
 		fatal("login failed", "err", err)
 	}
 
+	browser := cdpBrowser{s: s}
 	if err := chromedp.Run(browserCtx,
 		chromedp.ActionFunc(s.firstNav),
-		chromedp.ActionFunc(s.navN(*nItemsFlag, from, to)),
+		chromedp.ActionFunc(s.navN(browser, m, *nItemsFlag, from, to)),
 	); err != nil {
 		if ctx.Err() != nil {
 			logger.Warn("interrupted; progress saved to .lastdone")
@@ -354,7 +360,8 @@ func (s *Session) cleanDlDir() error {
 // download dir that must not be treated as a downloaded photo.
 func isIgnoredDLFile(name string) bool {
 	switch name {
-	case ".lastdone", ".lastdone.bak", "debug.png", "debug.html":
+	case ".lastdone", ".lastdone.bak", "debug.png", "debug.html",
+		manifestName, manifestName + ".tmp":
 		return true
 	}
 	return false
@@ -719,7 +726,7 @@ func startDownload(ctx context.Context) error {
 // finish. It returns the list of files that were downloaded (more than one for
 // e.g. live photos), and an error if the download stops making any progress for
 // too long.
-func (s *Session) download(ctx context.Context, location string) ([]string, error) {
+func (s *Session) download(ctx context.Context) ([]string, error) {
 	if err := startDownload(ctx); err != nil {
 		return nil, err
 	}
@@ -804,28 +811,32 @@ func (s *Session) download(ctx context.Context, location string) ([]string, erro
 
 // moveDownload moves the downloaded files into their destination directory,
 // optionally setting their modification time to the photo date. It returns the
-// new paths of the moved files.
-func (s *Session) moveDownload(files []string, location string, photoTime time.Time, haveTime bool) ([]string, error) {
+// new paths of the moved files and their total size in bytes.
+func (s *Session) moveDownload(files []string, location string, photoTime time.Time, haveTime bool) ([]string, int64, error) {
 	itemID := photoIDFromURL(location)
 	dir := organizedDir(s.dlDir, photoTime, haveTime, itemID, *organizeFlag)
 	if err := os.MkdirAll(dir, 0700); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	var out []string
+	var total int64
 	for _, name := range files {
 		src := filepath.Join(s.dlDir, name)
 		dst := uniqueDest(dir, name, itemID)
 		if err := os.Rename(src, dst); err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 		if haveTime && (*organizeFlag || *mtimeFlag) {
 			if err := os.Chtimes(dst, photoTime, photoTime); err != nil {
 				logger.Warn("could not set modification time", "file", dst, "err", err)
 			}
 		}
+		if fi, err := os.Stat(dst); err == nil {
+			total += fi.Size()
+		}
 		out = append(out, dst)
 	}
-	return out, nil
+	return out, total, nil
 }
 
 // uniqueDest returns a destination path inside dir for the given file name. If a
@@ -841,22 +852,6 @@ func uniqueDest(dir, name, itemID string) string {
 	ext := filepath.Ext(name)
 	base := strings.TrimSuffix(name, ext)
 	return filepath.Join(dir, base+"_"+itemID+ext)
-}
-
-func (s *Session) dlAndMove(ctx context.Context, location string, photoTime time.Time, haveTime bool) ([]string, error) {
-	files, err := s.download(ctx, location)
-	if err != nil {
-		return nil, err
-	}
-	moved, err := s.moveDownload(files, location, photoTime, haveTime)
-	if err != nil {
-		return nil, err
-	}
-	// Only record the item as done once its files are safely in place.
-	if err := markDone(s.dlDir, location); err != nil {
-		return nil, err
-	}
-	return moved, nil
 }
 
 // photoIDFromURL extracts the Google Photos item id from a photo URL. It works
@@ -929,28 +924,48 @@ func listenNavEvents(ctx context.Context) {
 // navN successively downloads the currently viewed item, and navigates to the
 // next item (to the left). It repeats N times or until the last (i.e. the most
 // recent) item is reached. Set a negative N to repeat until the end is reached.
-func (s *Session) navN(N int, from, to time.Time) func(context.Context) error {
+//
+// All Chrome interaction goes through the Browser seam, and per-item state is
+// recorded in the manifest, so this loop is exercised by unit tests with a fake
+// browser (see browser_test.go).
+func (s *Session) navN(browser Browser, m *Manifest, N int, from, to time.Time) func(context.Context) error {
 	return func(ctx context.Context) error {
-		n := 0
 		if N == 0 {
 			return nil
 		}
 
-		listenNavEvents(ctx)
+		// Persist the manifest on every exit: completion, error or interruption.
+		// .lastdone remains the authoritative per-item resume sentinel.
+		defer func() {
+			if *dryRunFlag {
+				return
+			}
+			if err := m.Save(); err != nil {
+				logger.Warn("could not save manifest", "err", err)
+			}
+		}()
+
+		if err := browser.Start(ctx); err != nil {
+			return err
+		}
 
 		dateNeeded := !from.IsZero() || !to.IsZero() || *organizeFlag || *mtimeFlag || *dryRunFlag
 		if dateNeeded {
 			// The info side panel persists across navigation and exposes the
 			// capture date, so we open it once up front.
-			ensureInfoPanel(ctx)
+			if err := browser.OpenInfoPanel(ctx); err != nil {
+				return err
+			}
 		}
 
-		var location, prevLocation string
+		n := 0
+		var prevLocation string
 		for {
 			if err := ctx.Err(); err != nil {
 				return err
 			}
-			if err := chromedp.Location(&location).Do(ctx); err != nil {
+			location, err := browser.Location(ctx)
+			if err != nil {
 				return err
 			}
 			if location == prevLocation {
@@ -961,8 +976,10 @@ func (s *Session) navN(N int, from, to time.Time) func(context.Context) error {
 			var photoTime time.Time
 			haveTime := false
 			if dateNeeded {
-				photoTime, haveTime = getPhotoTime(ctx)
+				photoTime, haveTime = browser.PhotoTime(ctx)
 			}
+			m.Seen(location, photoTime, haveTime)
+
 			download, stop := dateDecision(photoTime, haveTime, from, to)
 			if stop {
 				logger.Info("reached -to bound, stopping", "location", location)
@@ -973,22 +990,33 @@ func (s *Session) navN(N int, from, to time.Time) func(context.Context) error {
 				if *dryRunFlag {
 					logger.Info("dry-run: would download", "n", n+1, "location", location, "photo_time", timeAttr(photoTime, haveTime))
 				} else {
-					filePaths, err := s.dlAndMove(ctx, location, photoTime, haveTime)
+					files, err := browser.Download(ctx)
 					if err != nil {
+						m.Errored(location, err)
 						return err
 					}
-					for _, f := range filePaths {
+					moved, nbytes, err := s.moveDownload(files, location, photoTime, haveTime)
+					if err != nil {
+						m.Errored(location, err)
+						return err
+					}
+					if err := markDone(s.dlDir, location); err != nil {
+						return err
+					}
+					m.Done(location, moved, nbytes)
+					for _, f := range moved {
 						if err := doRun(f); err != nil {
 							return err
 						}
 					}
-					logger.Info("downloaded", "n", n+1, "files", len(filePaths), "location", location, "photo_time", timeAttr(photoTime, haveTime))
+					logger.Info("downloaded", "n", n+1, "files", len(moved), "bytes", nbytes, "location", location, "photo_time", timeAttr(photoTime, haveTime))
 				}
 				n++
 				if N > 0 && n >= N {
 					break
 				}
 			} else {
+				m.Skipped(location)
 				logger.Debug("skipping item (out of date range)", "location", location, "photo_time", timeAttr(photoTime, haveTime))
 			}
 
@@ -996,11 +1024,11 @@ func (s *Session) navN(N int, from, to time.Time) func(context.Context) error {
 				break
 			}
 
-			if err := navLeft(ctx); err != nil {
+			if err := browser.Next(ctx); err != nil {
 				return fmt.Errorf("error at %v: %v", location, err)
 			}
 		}
-		logger.Info("navigation complete", "downloaded", n)
+		logger.Info("navigation complete", "downloaded", n, "manifest", m.Counts())
 		return nil
 	}
 }
