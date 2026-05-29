@@ -332,6 +332,41 @@ func TestIsIgnoredDLFile(t *testing.T) {
 	}
 }
 
+func TestUniqueDest(t *testing.T) {
+	dir := t.TempDir()
+
+	// No existing file: the plain name is used.
+	if got, want := uniqueDest(dir, "IMG_0001.jpg", "ITEMID"), filepath.Join(dir, "IMG_0001.jpg"); got != want {
+		t.Errorf("uniqueDest (no collision) = %q, want %q", got, want)
+	}
+
+	// Existing file: disambiguate with the item id before the extension.
+	if err := os.WriteFile(filepath.Join(dir, "IMG_0001.jpg"), []byte("x"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := uniqueDest(dir, "IMG_0001.jpg", "ITEMID"), filepath.Join(dir, "IMG_0001_ITEMID.jpg"); got != want {
+		t.Errorf("uniqueDest (collision) = %q, want %q", got, want)
+	}
+
+	// File with no extension still works.
+	if err := os.WriteFile(filepath.Join(dir, "noext"), []byte("x"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := uniqueDest(dir, "noext", "ID2"), filepath.Join(dir, "noext_ID2"); got != want {
+		t.Errorf("uniqueDest (no ext) = %q, want %q", got, want)
+	}
+}
+
+func TestTimeAttr(t *testing.T) {
+	if got := timeAttr(time.Time{}, false); got != "unknown" {
+		t.Errorf("timeAttr(unknown) = %q, want %q", got, "unknown")
+	}
+	tm := time.Date(2024, 3, 14, 12, 8, 27, 0, time.UTC)
+	if got, want := timeAttr(tm, true), "2024-03-14T12:08:27Z"; got != want {
+		t.Errorf("timeAttr = %q, want %q", got, want)
+	}
+}
+
 func TestParseLevel(t *testing.T) {
 	tests := map[string]string{
 		"debug":   "DEBUG",

@@ -105,6 +105,7 @@ gphotos-cdp [flags]
 | Flag | Default | Description |
 | --- | --- | --- |
 | `-n` | `-1` | Number of items to download. Negative means "all". |
+| `-dry-run` | `false` | Walk the timeline and log what *would* be downloaded, without downloading anything or touching the download dir. |
 | `-dev` | `false` | Reuse the same session dir so you don't have to authenticate every run. |
 | `-dldir` | `$HOME/Downloads/gphotos-cdp` | Where to write downloads. |
 | `-session-dir` | `$TMPDIR/gphotos-cdp` | Where to load/save the Chrome profile in `-dev` mode. |
@@ -156,6 +157,14 @@ Download an album by id (the value after `/album/` in the album's URL):
 
 ```sh
 ./gphotos-cdp -dev -album AF1QipMyAlbumId
+```
+
+Preview what a date-filtered run would do, without downloading anything (a safe
+way to check the best-effort date detection works for your library before
+committing to a long run):
+
+```sh
+./gphotos-cdp -dev -dry-run -from 2023-01-01 -to 2023-12-31 -n 50
 ```
 
 

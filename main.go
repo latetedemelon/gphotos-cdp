@@ -64,6 +64,7 @@ var (
 	albumFlag     = flag.String("album", "", "download an album instead of the main library: an album id or a full URL (best-effort)")
 	albumTypeFlag = flag.String("album-type", "album", "the path segment used to build the album URL, as seen in the browser (e.g. album, share)")
 	dlTimeoutFlag = flag.Duration("dl-timeout", time.Minute, "how long a single download may stall (make no progress) before giving up")
+	dryRunFlag    = flag.Bool("dry-run", false, "walk the timeline and log what would be downloaded, without downloading anything or touching the download dir")
 )
 
 // libraryURL is the entry point for the Google Photos main library.
@@ -140,10 +141,14 @@ func main() {
 	}
 	defer s.Shutdown()
 
-	logger.Info("starting", "session_dir", s.profileDir, "download_dir", s.dlDir)
+	logger.Info("starting", "session_dir", s.profileDir, "download_dir", s.dlDir, "dry_run", *dryRunFlag)
 
-	if err := s.cleanDlDir(); err != nil {
-		fatal("could not clean download dir", "err", err)
+	// In dry-run mode we never write to the download dir, so we must not wipe
+	// any files the user already has there.
+	if !*dryRunFlag {
+		if err := s.cleanDlDir(); err != nil {
+			fatal("could not clean download dir", "err", err)
+		}
 	}
 
 	browserCtx, cancel := s.NewContext(ctx)
@@ -660,10 +665,10 @@ func startDownload(ctx context.Context) error {
 	return nil
 }
 
-// download starts the download of the currently viewed item, and on successful
-// completion saves its location as the most recent item downloaded. It returns
-// the list of files that were downloaded (more than one for e.g. live photos),
-// and an error if the download stops making any progress for too long.
+// download starts the download of the currently viewed item and waits for it to
+// finish. It returns the list of files that were downloaded (more than one for
+// e.g. live photos), and an error if the download stops making any progress for
+// too long.
 func (s *Session) download(ctx context.Context, location string) ([]string, error) {
 	if err := startDownload(ctx); err != nil {
 		return nil, err
@@ -743,10 +748,6 @@ func (s *Session) download(ctx context.Context, location string) ([]string, erro
 		}
 	}
 
-	if err := markDone(s.dlDir, location); err != nil {
-		return nil, err
-	}
-
 	sort.Strings(result)
 	return result, nil
 }
@@ -763,7 +764,7 @@ func (s *Session) moveDownload(files []string, location string, photoTime time.T
 	var out []string
 	for _, name := range files {
 		src := filepath.Join(s.dlDir, name)
-		dst := filepath.Join(dir, name)
+		dst := uniqueDest(dir, name, itemID)
 		if err := os.Rename(src, dst); err != nil {
 			return nil, err
 		}
@@ -777,12 +778,35 @@ func (s *Session) moveDownload(files []string, location string, photoTime time.T
 	return out, nil
 }
 
+// uniqueDest returns a destination path inside dir for the given file name. If a
+// file of that name already exists (possible when -organize groups items that
+// share an original filename into the same YYYY/MM folder), the item id is
+// inserted before the extension to keep the names distinct and avoid clobbering
+// an existing download.
+func uniqueDest(dir, name, itemID string) string {
+	dst := filepath.Join(dir, name)
+	if _, err := os.Stat(dst); os.IsNotExist(err) {
+		return dst
+	}
+	ext := filepath.Ext(name)
+	base := strings.TrimSuffix(name, ext)
+	return filepath.Join(dir, base+"_"+itemID+ext)
+}
+
 func (s *Session) dlAndMove(ctx context.Context, location string, photoTime time.Time, haveTime bool) ([]string, error) {
 	files, err := s.download(ctx, location)
 	if err != nil {
 		return nil, err
 	}
-	return s.moveDownload(files, location, photoTime, haveTime)
+	moved, err := s.moveDownload(files, location, photoTime, haveTime)
+	if err != nil {
+		return nil, err
+	}
+	// Only record the item as done once its files are safely in place.
+	if err := markDone(s.dlDir, location); err != nil {
+		return nil, err
+	}
+	return moved, nil
 }
 
 // photoIDFromURL extracts the Google Photos item id from a photo URL. It works
@@ -864,11 +888,11 @@ func (s *Session) navN(N int, from, to time.Time) func(context.Context) error {
 
 		listenNavEvents(ctx)
 
-		dateNeeded := !from.IsZero() || !to.IsZero() || *organizeFlag || *mtimeFlag
+		dateNeeded := !from.IsZero() || !to.IsZero() || *organizeFlag || *mtimeFlag || *dryRunFlag
 		if dateNeeded {
 			// The info side panel persists across navigation and exposes the
 			// capture date, so we open it once up front.
-			openInfoPanel(ctx)
+			ensureInfoPanel(ctx)
 		}
 
 		var location, prevLocation string
@@ -896,22 +920,26 @@ func (s *Session) navN(N int, from, to time.Time) func(context.Context) error {
 			}
 
 			if download {
-				filePaths, err := s.dlAndMove(ctx, location, photoTime, haveTime)
-				if err != nil {
-					return err
-				}
-				for _, f := range filePaths {
-					if err := doRun(f); err != nil {
+				if *dryRunFlag {
+					logger.Info("dry-run: would download", "n", n+1, "location", location, "photo_time", timeAttr(photoTime, haveTime))
+				} else {
+					filePaths, err := s.dlAndMove(ctx, location, photoTime, haveTime)
+					if err != nil {
 						return err
 					}
+					for _, f := range filePaths {
+						if err := doRun(f); err != nil {
+							return err
+						}
+					}
+					logger.Info("downloaded", "n", n+1, "files", len(filePaths), "location", location, "photo_time", timeAttr(photoTime, haveTime))
 				}
 				n++
-				logger.Info("downloaded", "n", n, "files", len(filePaths), "location", location)
 				if N > 0 && n >= N {
 					break
 				}
 			} else {
-				logger.Debug("skipping item (out of date range)", "location", location)
+				logger.Debug("skipping item (out of date range)", "location", location, "photo_time", timeAttr(photoTime, haveTime))
 			}
 
 			if strings.HasSuffix(location, s.firstItem) {
@@ -927,11 +955,26 @@ func (s *Session) navN(N int, from, to time.Time) func(context.Context) error {
 	}
 }
 
-// openInfoPanel toggles the Google Photos info side panel open (keyboard 'i'),
-// which reveals the capture date used by the date-based features. Best-effort.
-func openInfoPanel(ctx context.Context) {
+// ensureInfoPanel makes sure the Google Photos info side panel is open (it is
+// toggled with the 'i' key and reveals the capture date used by the date-based
+// features). If a date can't be read after toggling, the panel may already have
+// been open and we just closed it, so we toggle back. Best-effort.
+func ensureInfoPanel(ctx context.Context) {
 	chromedp.KeyEvent("i").Do(ctx)
 	time.Sleep(tick)
+	if _, ok := getPhotoTime(ctx); ok {
+		return
+	}
+	chromedp.KeyEvent("i").Do(ctx)
+	time.Sleep(tick)
+}
+
+// timeAttr renders a (possibly unknown) photo time for logging.
+func timeAttr(t time.Time, ok bool) string {
+	if !ok {
+		return "unknown"
+	}
+	return t.Format(time.RFC3339)
 }
 
 // getPhotoTime makes a best-effort attempt to read the capture date of the
