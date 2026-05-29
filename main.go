@@ -46,25 +46,27 @@ import (
 )
 
 var (
-	nItemsFlag    = flag.Int("n", -1, "number of items to download. If negative, get them all.")
-	devFlag       = flag.Bool("dev", false, "dev mode. we reuse the same session dir (/tmp/gphotos-cdp), so we don't have to auth at every run.")
-	dlDirFlag     = flag.String("dldir", "", "where to write the downloads. defaults to $HOME/Downloads/gphotos-cdp.")
-	startFlag     = flag.String("start", "", "skip all photos until this location is reached. for debugging.")
-	runFlag       = flag.String("run", "", "the program to run on each downloaded item, right after it is downloaded. It is also the responsibility of that program to remove the downloaded item, if desired.")
-	verboseFlag   = flag.Bool("v", false, "be verbose (shortcut for -log-level=debug)")
-	headlessFlag  = flag.Bool("headless", false, "Start chrome browser in headless mode (only in -dev mode; cannot do authentication this way).")
-	sessDirFlag   = flag.String("session-dir", filepath.Join(os.TempDir(), "gphotos-cdp"), "where to load/save the chrome profile from in -dev mode")
-	execPathFlag  = flag.String("chrome-exec-path", "", "path to the Chrome/Chromium binary to use (default: auto-detect)")
-	jsonLogFlag   = flag.Bool("json", false, "output logs in JSON format")
-	logLevelFlag  = flag.String("log-level", "info", "log level: debug, info, warn, error")
-	fromFlag      = flag.String("from", "", "only download items taken on or after this date, YYYY-MM-DD (best-effort, see README)")
-	toFlag        = flag.String("to", "", "only download items taken on or before this date, YYYY-MM-DD (best-effort, see README)")
-	organizeFlag  = flag.Bool("organize", false, "sort downloads into YYYY/MM sub-folders by photo date (best-effort)")
-	mtimeFlag     = flag.Bool("mtime", false, "set each downloaded file's modification time to the photo date (best-effort)")
-	albumFlag     = flag.String("album", "", "download an album instead of the main library: an album id or a full URL (best-effort)")
-	albumTypeFlag = flag.String("album-type", "album", "the path segment used to build the album URL, as seen in the browser (e.g. album, share)")
-	dlTimeoutFlag = flag.Duration("dl-timeout", time.Minute, "how long a single download may stall (make no progress) before giving up")
-	dryRunFlag    = flag.Bool("dry-run", false, "walk the timeline and log what would be downloaded, without downloading anything or touching the download dir")
+	nItemsFlag      = flag.Int("n", -1, "number of items to download. If negative, get them all.")
+	devFlag         = flag.Bool("dev", false, "dev mode. we reuse the same session dir (/tmp/gphotos-cdp), so we don't have to auth at every run.")
+	dlDirFlag       = flag.String("dldir", "", "where to write the downloads. defaults to $HOME/Downloads/gphotos-cdp.")
+	startFlag       = flag.String("start", "", "skip all photos until this location is reached. for debugging.")
+	runFlag         = flag.String("run", "", "the program to run on each downloaded item, right after it is downloaded. It is also the responsibility of that program to remove the downloaded item, if desired.")
+	verboseFlag     = flag.Bool("v", false, "be verbose (shortcut for -log-level=debug)")
+	headlessFlag    = flag.Bool("headless", false, "Start chrome browser in headless mode (only in -dev mode; cannot do authentication this way).")
+	sessDirFlag     = flag.String("session-dir", filepath.Join(os.TempDir(), "gphotos-cdp"), "where to load/save the chrome profile from in -dev mode")
+	execPathFlag    = flag.String("chrome-exec-path", "", "path to the Chrome/Chromium binary to use (default: auto-detect)")
+	jsonLogFlag     = flag.Bool("json", false, "output logs in JSON format")
+	logLevelFlag    = flag.String("log-level", "info", "log level: debug, info, warn, error")
+	fromFlag        = flag.String("from", "", "only download items taken on or after this date, YYYY-MM-DD (best-effort, see README)")
+	toFlag          = flag.String("to", "", "only download items taken on or before this date, YYYY-MM-DD (best-effort, see README)")
+	organizeFlag    = flag.Bool("organize", false, "sort downloads into YYYY/MM sub-folders by photo date (best-effort)")
+	mtimeFlag       = flag.Bool("mtime", false, "set each downloaded file's modification time to the photo date (best-effort)")
+	albumFlag       = flag.String("album", "", "download an album instead of the main library: an album id or a full URL (best-effort)")
+	albumTypeFlag   = flag.String("album-type", "album", "the path segment used to build the album URL, as seen in the browser (e.g. album, share)")
+	dlTimeoutFlag   = flag.Duration("dl-timeout", time.Minute, "how long a single download may stall (make no progress) before giving up")
+	dryRunFlag      = flag.Bool("dry-run", false, "walk the timeline and log what would be downloaded, without downloading anything or touching the download dir")
+	maxAttemptsFlag = flag.Int("max-attempts", 3, "how many times to attempt an item (across runs) before giving up on it")
+	failOnErrorFlag = flag.Bool("fail-on-error", false, "exit non-zero if the run completes with any items still in the errored state")
 )
 
 // chromeFlagsFlag collects -chrome-flag occurrences: raw flags passed straight
@@ -105,6 +107,10 @@ func parseChromeFlag(s string) (string, interface{}) {
 const libraryURL = "https://photos.google.com/"
 
 var tick = 500 * time.Millisecond
+
+// retryBaseDelay is the base backoff between in-run download retries; the nth
+// retry waits n*retryBaseDelay. It is a var so tests can set it to zero.
+var retryBaseDelay = 2 * time.Second
 
 // logger is the process-wide structured logger, configured in setupLogger.
 var logger = slog.New(slog.NewTextHandler(os.Stderr, nil))
@@ -189,6 +195,10 @@ func main() {
 	if err != nil {
 		fatal("could not load manifest", "err", err)
 	}
+	// Resume from the manifest (its newest completed item), which supersedes the
+	// legacy .lastdone (migrated into the manifest on first load).
+	s.lastDone = m.ResumeURL()
+	logger.Debug("resume point", "url", s.lastDone)
 
 	browserCtx, cancel := s.NewContext(ctx)
 	defer cancel()
@@ -211,6 +221,13 @@ func main() {
 			return
 		}
 		fatal("run failed", "err", err)
+	}
+	if errored := m.Counts()[StatusErrored]; errored > 0 {
+		logger.Warn("run completed with errored items (recorded in the manifest for a later retry)",
+			"errored", errored, "max_attempts", *maxAttemptsFlag)
+		if *failOnErrorFlag {
+			os.Exit(1)
+		}
 	}
 	logger.Info("all done")
 	fmt.Println("OK")
@@ -959,6 +976,7 @@ func (s *Session) navN(browser Browser, m *Manifest, N int, from, to time.Time) 
 		}
 
 		n := 0
+		errored := 0
 		var prevLocation string
 		for {
 			if err := ctx.Err(); err != nil {
@@ -986,38 +1004,27 @@ func (s *Session) navN(browser Browser, m *Manifest, N int, from, to time.Time) 
 				break
 			}
 
-			if download {
-				if *dryRunFlag {
-					logger.Info("dry-run: would download", "n", n+1, "location", location, "photo_time", timeAttr(photoTime, haveTime))
-				} else {
-					files, err := browser.Download(ctx)
-					if err != nil {
-						m.Errored(location, err)
-						return err
-					}
-					moved, nbytes, err := s.moveDownload(files, location, photoTime, haveTime)
-					if err != nil {
-						m.Errored(location, err)
-						return err
-					}
-					if err := markDone(s.dlDir, location); err != nil {
-						return err
-					}
-					m.Done(location, moved, nbytes)
-					for _, f := range moved {
-						if err := doRun(f); err != nil {
-							return err
-						}
-					}
-					logger.Info("downloaded", "n", n+1, "files", len(moved), "bytes", nbytes, "location", location, "photo_time", timeAttr(photoTime, haveTime))
-				}
-				n++
-				if N > 0 && n >= N {
-					break
-				}
-			} else {
+			if !download {
 				m.Skipped(location)
 				logger.Debug("skipping item (out of date range)", "location", location, "photo_time", timeAttr(photoTime, haveTime))
+			} else if *dryRunFlag {
+				logger.Info("dry-run: would download", "n", n+1, "location", location, "photo_time", timeAttr(photoTime, haveTime))
+				n++
+			} else {
+				outcome, err := s.downloadItem(ctx, browser, m, location, photoTime, haveTime)
+				if err != nil {
+					return err
+				}
+				switch outcome {
+				case outcomeDownloaded:
+					n++
+				case outcomeGaveUp:
+					errored++
+				}
+			}
+
+			if N > 0 && n >= N {
+				break
 			}
 
 			if strings.HasSuffix(location, s.firstItem) {
@@ -1028,9 +1035,84 @@ func (s *Session) navN(browser Browser, m *Manifest, N int, from, to time.Time) 
 				return fmt.Errorf("error at %v: %v", location, err)
 			}
 		}
+		if errored > 0 {
+			logger.Warn("some items failed this run", "errored", errored, "max_attempts", *maxAttemptsFlag)
+		}
 		logger.Info("navigation complete", "downloaded", n, "manifest", m.Counts())
 		return nil
 	}
+}
+
+// itemOutcome is the result of attempting one item in navN.
+type itemOutcome int
+
+const (
+	outcomeDownloaded itemOutcome = iota // successfully downloaded this run
+	outcomeSkipped                       // already done in the manifest; nothing to do
+	outcomeGaveUp                        // failed and out of attempts
+)
+
+// downloadItem downloads a single item with per-item retry and error isolation.
+//
+// It returns outcomeDownloaded on success, outcomeSkipped if the item is already
+// done in the manifest, and outcomeGaveUp if the download keeps failing (or the
+// item already exhausted its attempts on a previous run). It returns a non-nil
+// error only for failures that should abort the whole run (context cancellation,
+// a filesystem error, or a failing -run command) — a failed download itself is
+// isolated: it is recorded in the manifest and the caller moves on.
+func (s *Session) downloadItem(ctx context.Context, browser Browser, m *Manifest, location string, photoTime time.Time, haveTime bool) (itemOutcome, error) {
+	id := photoIDFromURL(location)
+	attempts := 0
+	if it, ok := m.Get(id); ok {
+		if it.Status == StatusDone {
+			logger.Debug("already downloaded, skipping", "location", location)
+			return outcomeSkipped, nil
+		}
+		attempts = it.Attempts
+	}
+	if attempts >= *maxAttemptsFlag {
+		logger.Warn("giving up: item already reached max attempts", "location", location, "attempts", attempts, "max", *maxAttemptsFlag)
+		return outcomeGaveUp, nil
+	}
+
+	var lastErr error
+	for attempt := attempts; attempt < *maxAttemptsFlag; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return outcomeGaveUp, err
+		}
+		if attempt > attempts {
+			// Back off and clear any partial download left by the failed attempt.
+			time.Sleep(retryBaseDelay * time.Duration(attempt-attempts))
+			if err := s.cleanDlDir(); err != nil {
+				return outcomeGaveUp, err
+			}
+		}
+
+		files, err := browser.Download(ctx)
+		if err == nil {
+			var moved []string
+			var nbytes int64
+			moved, nbytes, err = s.moveDownload(files, location, photoTime, haveTime)
+			if err == nil {
+				if err := markDone(s.dlDir, location); err != nil {
+					return outcomeGaveUp, err // filesystem failure: fatal
+				}
+				m.Done(location, moved, nbytes)
+				for _, f := range moved {
+					if err := doRun(f); err != nil {
+						return outcomeGaveUp, err // -run failure: fatal (as before)
+					}
+				}
+				logger.Info("downloaded", "files", len(moved), "bytes", nbytes, "location", location, "photo_time", timeAttr(photoTime, haveTime), "attempt", attempt+1)
+				return outcomeDownloaded, nil
+			}
+		}
+		m.Errored(location, err)
+		lastErr = err
+		logger.Warn("download attempt failed", "location", location, "attempt", attempt+1, "max", *maxAttemptsFlag, "err", err)
+	}
+	logger.Error("giving up after failed attempts", "location", location, "attempts", *maxAttemptsFlag, "err", lastErr)
+	return outcomeGaveUp, nil
 }
 
 // ensureInfoPanel makes sure the Google Photos info side panel is open (it is
