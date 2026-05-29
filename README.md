@@ -99,7 +99,19 @@ Usage
 --------
 
 ```
-gphotos-cdp [flags]
+gphotos-cdp [flags]          # download (the default command)
+gphotos-cdp status [flags]   # print a summary of progress (no Chrome needed)
+gphotos-cdp verify [flags]   # check that downloaded files still exist and match
+```
+
+`status` and `verify` read `<dldir>/.manifest.json` and don't open a browser, so
+they're instant and need no authentication. Point them at your library with
+`-dldir`:
+
+```sh
+gphotos-cdp status -dldir /download
+gphotos-cdp status -dldir /download -csv inventory.csv   # also export an inventory
+gphotos-cdp verify -dldir /download                      # exits non-zero if any file is missing/changed
 ```
 
 | Flag | Default | Description |
@@ -120,6 +132,9 @@ gphotos-cdp [flags]
 | `-album` | – | Download an album instead of the main library (album id or full URL). Best-effort. |
 | `-album-type` | `album` | Path segment used to build the album URL (e.g. `album`, `share`). |
 | `-dl-timeout` | `1m` | How long a single download may stall before giving up. |
+| `-max-attempts` | `3` | Attempts per item (counted across runs) before giving up on it. A failed item is isolated so the run continues. |
+| `-fail-on-error` | `false` | Exit non-zero if the run finishes with any items still in the errored state. |
+| `-csv` | – | With the `status` command, also write the full inventory to this CSV file. |
 | `-json` | `false` | Emit logs as JSON. |
 | `-log-level` | `info` | Log level: `debug`, `info`, `warn`, `error`. |
 | `-v` | `false` | Verbose; shortcut for `-log-level=debug`. |
@@ -197,11 +212,11 @@ How it works
 
 1. It drives Chrome to `https://photos.google.com/` and waits for you to be
    authenticated (in `-dev` mode the profile is reused so this only happens once).
-2. It jumps to the end of the timeline (the oldest item), or resumes from
-   `.lastdone`, or starts at `-start`/`-album`.
+2. It jumps to the end of the timeline (the oldest item), or resumes from where
+   the previous run left off, or starts at `-start`/`-album`.
 3. It opens each item, triggers the native "download original" action
    (`Shift+D`), waits for the file(s) to finish downloading, moves them into
-   place, optionally runs `-run` on them, and records progress in `.lastdone`.
+   place, optionally runs `-run` on them, and records progress.
 4. It then navigates to the next (more recent) item and repeats, until `-n`
    items are downloaded or the most recent item is reached.
 
@@ -211,6 +226,21 @@ all resulting files are moved together and `-run` is invoked on each.
 Every per-item log line carries the item's URL in a stable `location` field
 (`location=https://photos.google.com/photo/…` in text logs, `"location"` in
 JSON), so you can always recover the last processed item by grepping the logs.
+
+### Progress, resume & retries
+
+Progress is tracked in two places under the download dir: the legacy
+`.lastdone` sentinel (the most recent completed item) and `.manifest.json`, a
+per-item record (id, URL, status, capture date, files, size, attempts, error).
+Resume is driven by the manifest — a re-run continues from the newest completed
+item and skips anything already done, so re-running the same command is cheap
+and idempotent.
+
+A single failing item no longer aborts the run. Each download is retried with
+backoff up to `-max-attempts` (counted across runs); if it still fails the item
+is recorded as `errored` and the run moves on. Errored items are visible in the
+manifest for inspection; pass `-fail-on-error` to make the process exit non-zero
+when any remain.
 
 
 Notes on the date-based features
@@ -255,8 +285,10 @@ Limitations & future work
   cross-album de-duplication are not handled specially.
 - Downloads are sequential (one item at a time). A `-workers` style concurrent
   mode would speed up large libraries but needs careful tab management.
-- Progress tracking is a single `.lastdone` sentinel rather than a full index,
-  so re-downloading a specific item means using `-start`.
+- Resume continues forward from the newest completed item. Items that exhausted
+  their `-max-attempts` in a completed run are recorded as `errored` but not yet
+  re-tried automatically on later runs (a `-retry-errored` mode is future work);
+  for now, re-downloading a specific item means using `-start`.
 
 Contributions are welcome. Planned work and ideas are tracked in
 [BACKLOG.md](BACKLOG.md).

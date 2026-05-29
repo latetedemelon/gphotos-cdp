@@ -1,0 +1,228 @@
+/*
+Copyright 2019 The Perkeep Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package main
+
+import (
+	"bytes"
+	"encoding/csv"
+	"errors"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+)
+
+const (
+	urlA = "https://photos.google.com/photo/idA"
+	urlB = "https://photos.google.com/photo/idB"
+	urlC = "https://photos.google.com/photo/idC"
+)
+
+func TestManifestRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	m, err := LoadManifest(dir)
+	if err != nil {
+		t.Fatalf("LoadManifest: %v", err)
+	}
+
+	date := time.Date(2024, 3, 14, 12, 8, 27, 0, time.UTC)
+	m.Seen(urlA, date, true)
+	m.Done(urlA, []string{"/dl/idA/a.jpg"}, 123)
+	m.Seen(urlB, time.Time{}, false)
+	m.Skipped(urlB)
+	m.Errored(urlC, errors.New("boom"))
+
+	if err := m.Save(); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	m2, err := LoadManifest(dir)
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+
+	itA, ok := m2.Get("idA")
+	if !ok || itA.Status != StatusDone || itA.Bytes != 123 || !itA.HaveDate || !itA.Date.Equal(date) {
+		t.Errorf("idA reloaded wrong: %+v (ok=%v)", itA, ok)
+	}
+	if len(itA.Files) != 1 || itA.Files[0] != "/dl/idA/a.jpg" {
+		t.Errorf("idA files wrong: %v", itA.Files)
+	}
+	if itB, ok := m2.Get("idB"); !ok || itB.Status != StatusSkipped {
+		t.Errorf("idB reloaded wrong: %+v (ok=%v)", itB, ok)
+	}
+	if itC, ok := m2.Get("idC"); !ok || itC.Status != StatusErrored || itC.Attempts != 1 || itC.Err != "boom" {
+		t.Errorf("idC reloaded wrong: %+v (ok=%v)", itC, ok)
+	}
+}
+
+func TestManifestMigratesLastdone(t *testing.T) {
+	dir := t.TempDir()
+	// No manifest yet, but a legacy .lastdone exists.
+	if err := markDone(dir, urlA); err != nil {
+		t.Fatalf("markDone: %v", err)
+	}
+	m, err := LoadManifest(dir)
+	if err != nil {
+		t.Fatalf("LoadManifest: %v", err)
+	}
+	it, ok := m.Get("idA")
+	if !ok || it.Status != StatusDone || it.URL != urlA {
+		t.Errorf("migrated item wrong: %+v (ok=%v)", it, ok)
+	}
+	if !m.IsDone(urlA) {
+		t.Error("IsDone(urlA) = false, want true after migration")
+	}
+}
+
+func TestManifestCounts(t *testing.T) {
+	m, _ := LoadManifest(t.TempDir())
+	m.Done(urlA, nil, 0)
+	m.Skipped(urlB)
+	m.Errored(urlC, errors.New("x"))
+	m.Seen("https://photos.google.com/photo/idD", time.Time{}, false) // pending
+
+	c := m.Counts()
+	if c[StatusDone] != 1 || c[StatusSkipped] != 1 || c[StatusErrored] != 1 || c[StatusPending] != 1 {
+		t.Errorf("counts = %v", c)
+	}
+}
+
+func TestManifestSaveAtomicAndIgnored(t *testing.T) {
+	dir := t.TempDir()
+	m, _ := LoadManifest(dir)
+	m.Done(urlA, []string{"a.jpg"}, 1)
+	if err := m.Save(); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, manifestName)); err != nil {
+		t.Fatalf("manifest file missing: %v", err)
+	}
+	// No leftover temp file.
+	if _, err := os.Stat(filepath.Join(dir, manifestName+".tmp")); !os.IsNotExist(err) {
+		t.Errorf("temp file should not remain: %v", err)
+	}
+	// The download loop must never treat the manifest as a downloaded photo.
+	if !isIgnoredDLFile(manifestName) || !isIgnoredDLFile(manifestName+".tmp") {
+		t.Error("manifest files should be ignored by the download dir scan")
+	}
+}
+
+func TestSummarize(t *testing.T) {
+	m, _ := LoadManifest(t.TempDir())
+	m.Done(urlA, []string{"/x/a.jpg"}, 100)
+	m.Done(urlB, []string{"/x/b.jpg"}, 50)
+	m.Errored(urlC, errors.New("x"))
+
+	counts, totalBytes, total := summarize(m)
+	if total != 3 || totalBytes != 150 {
+		t.Errorf("summarize total=%d bytes=%d, want 3/150", total, totalBytes)
+	}
+	if counts[StatusDone] != 2 || counts[StatusErrored] != 1 {
+		t.Errorf("counts = %v", counts)
+	}
+}
+
+func TestVerifyManifest(t *testing.T) {
+	dir := t.TempDir()
+	m, _ := LoadManifest(dir)
+
+	// good: file exists and total size matches.
+	good := filepath.Join(dir, "good.jpg")
+	if err := os.WriteFile(good, []byte("12345"), 0600); err != nil { // 5 bytes
+		t.Fatal(err)
+	}
+	m.Done("https://photos.google.com/photo/idGood", []string{good}, 5)
+
+	// missing: recorded file does not exist.
+	m.Done("https://photos.google.com/photo/idMissing", []string{filepath.Join(dir, "nope.jpg")}, 10)
+
+	// size mismatch: file exists but its size differs from the recorded total.
+	bad := filepath.Join(dir, "bad.jpg")
+	if err := os.WriteFile(bad, []byte("xx"), 0600); err != nil { // 2 bytes
+		t.Fatal(err)
+	}
+	m.Done("https://photos.google.com/photo/idBad", []string{bad}, 999)
+
+	// done but no files recorded: not checkable, skipped.
+	m.Done("https://photos.google.com/photo/idNoFiles", nil, 0)
+	// not done: ignored.
+	m.Errored("https://photos.google.com/photo/idErr", errors.New("x"))
+
+	res := verifyManifest(m)
+	if res.Checked != 3 {
+		t.Errorf("Checked = %d, want 3", res.Checked)
+	}
+	if res.OK != 1 {
+		t.Errorf("OK = %d, want 1", res.OK)
+	}
+	if len(res.Missing) != 1 || res.Missing[0] != "https://photos.google.com/photo/idMissing" {
+		t.Errorf("Missing = %v", res.Missing)
+	}
+	if len(res.SizeMismatch) != 1 || res.SizeMismatch[0] != "https://photos.google.com/photo/idBad" {
+		t.Errorf("SizeMismatch = %v", res.SizeMismatch)
+	}
+}
+
+func TestNewestDoneAndResumeURL(t *testing.T) {
+	m, _ := LoadManifest(t.TempDir())
+	if m.ResumeURL() != "" {
+		t.Errorf("empty manifest ResumeURL = %q, want \"\"", m.ResumeURL())
+	}
+
+	// Insertion order is timeline order (oldest first): A done, B errored, C done.
+	m.Done(urlA, nil, 0)
+	m.Errored(urlB, errors.New("x"))
+	m.Done(urlC, nil, 0)
+
+	nd := m.NewestDone()
+	if nd == nil || nd.ID != "idC" {
+		t.Fatalf("NewestDone = %+v, want idC", nd)
+	}
+	if got := m.ResumeURL(); got != urlC {
+		t.Errorf("ResumeURL = %q, want %q", got, urlC)
+	}
+}
+
+func TestManifestCSV(t *testing.T) {
+	m, _ := LoadManifest(t.TempDir())
+	date := time.Date(2024, 3, 14, 0, 0, 0, 0, time.UTC)
+	m.Seen(urlA, date, true)
+	m.Done(urlA, []string{"/dl/2024/03/a.jpg", "/dl/2024/03/a.mp4"}, 42)
+
+	var buf bytes.Buffer
+	if err := m.WriteCSV(&buf); err != nil {
+		t.Fatalf("WriteCSV: %v", err)
+	}
+	rows, err := csv.NewReader(&buf).ReadAll()
+	if err != nil {
+		t.Fatalf("parse CSV: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("want header + 1 row, got %d rows", len(rows))
+	}
+	if rows[0][0] != "id" || rows[0][6] != "files" {
+		t.Errorf("header wrong: %v", rows[0])
+	}
+	got := rows[1]
+	if got[0] != "idA" || got[2] != string(StatusDone) || got[4] != "42" {
+		t.Errorf("row wrong: %v", got)
+	}
+	if got[6] != "/dl/2024/03/a.jpg;/dl/2024/03/a.mp4" {
+		t.Errorf("files column wrong: %q", got[6])
+	}
+}
