@@ -142,6 +142,43 @@ metadata uniformly regardless of source:
 Both paths — Google's Takeout JSON and our CDP scrape — normalize into this; the
 enhancer writes EXIF/XMP (`DateTimeOriginal`, GPS) + mtime + album tags from it.
 
+## Shared & partner albums (capture what Takeout can't)
+
+**Why it's a differentiator.** Google Takeout does **not** include photos other
+people shared with you (only your own library, plus partner-shared items you
+saved); `immich-go` documents this as an unavoidable Takeout gap. The CDP path
+drives the real Google Photos UI, which **can navigate shared content** — so we
+can capture material no Takeout-based importer can reach. This is the strongest
+single differentiator of the scraping approach.
+
+**What's reachable in the UI**
+
+- **Shared albums** — albums others shared with you, and ones you shared — under
+  the *Sharing* tab (`photos.google.com/sharing`); each is an album-like grid.
+- **Partner sharing** — a linked partner account's shared library.
+
+**Two distinct uses**
+
+1. **Membership only** — extend the `albums` index pass (above) to shared-album
+   grids, so shared albums become tags in the manifest. Cheap; no downloads.
+2. **Acquire shared-only items** — a `-include-shared` scope that *downloads*
+   items present in shared albums but **not** in your own library, backing up
+   what friends shared with you.
+
+**Caveats (be honest)**
+
+- Items shared *with* you that you never saved to your library behave like
+  **shared-link** content: the download may be **reduced quality and
+  GPS-stripped** (consistent with the owner-vs-shared EXIF finding above). Treat
+  shared-only acquisitions as best-effort and stamp provenance (`source=shared`).
+- **Dedup:** a shared item you also saved to your own library would appear twice;
+  the manifest join (item id / content hash) collapses it.
+- Shared/partner UI surfaces change; DOM-dependent, so best-effort like the rest
+  of the scraping.
+
+**Scope:** `-include-shared` (download) plus shared-album coverage in the
+`albums` index pass (membership). Off by default — it changes what gets pulled.
+
 ## Takeout interop & the normalized-library pipeline
 
 Target an **app-neutral normalized library** — embedded-EXIF files + a clean
@@ -179,9 +216,8 @@ a hard dependency on one app.
 
 ## Features to consider (mined from immich-go / GPTH / docker tools)
 
-- **Shared / partner albums (differentiator).** Takeout *omits* friend-shared
-  photos (a Google limitation immich-go calls out) — but the **CDP UI can see
-  them**. A shared-album scope could capture content no Takeout-based tool can.
+- **Shared / partner albums (differentiator).** Captures friend-shared photos
+  Takeout can't — see the dedicated **Shared & partner albums** section above.
 - **Favorites & archive status.** Scrape the star/archive state and map to the
   app's favorite/archive (server-side, UI-scrapeable).
 - **Grouping / stacks.** Group RAW+JPEG, bursts, and live-photo (JPEG+MP4) pairs
